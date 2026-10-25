@@ -1,0 +1,201 @@
+// Auth model:
+//  - Access token: short-lived HS256 JWT (default 15 min), sent as a Bearer header
+//    and in the Socket.io handshake. Kept in memory on the client, never in storage.
+//  - Refresh token: opaque random secret in an httpOnly, SameSite=Strict cookie
+//    scoped to /api/auth. Only its SHA-256 hash is stored server-side, it is
+//    rotated on every use, and presenting a stale one revokes the whole session.
+//  - Every access token carries its session id, so logout/revocation takes effect
+//    immediately for HTTP requests and connected sockets alike.
+import crypto from 'node:crypto';
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
+import { config } from './config.js';
+import { users, sessions, publicUser } from './db.js';
+
+const REFRESH_COOKIE = 'rt_refresh';
+const ROTATION_GRACE_MS = 10_000; // lets two tabs refresh concurrently without tripping reuse detection
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const DUMMY_HASH = bcrypt.hashSync('timing-equaliser', 12);
+
+export class AuthError extends Error {
+  constructor(code, message = 'Unauthorized', status = 401) {
+    super(message);
+    this.code = code;
+    this.status = status;
+  }
+}
+
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest();
+
+function signAccessToken(user, sid) {
+  return jwt.sign({ sub: user.id, username: user.username, sid }, config.accessSecret, {
+    algorithm: 'HS256',
+    expiresIn: config.accessTtl,
+    issuer: 'rt-chat',
+  });
+}
+
+/** Validates the JWT *and* that its session is still live. Returns { user, sid, exp }. */
+export function verifyAccessToken(token) {
+  let payload;
+  try {
+    payload = jwt.verify(token, config.accessSecret, { algorithms: ['HS256'], issuer: 'rt-chat' });
+  } catch (err) {
+    throw new AuthError(err instanceof jwt.TokenExpiredError ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN');
+  }
+  const session = sessions.findById(payload.sid);
+  if (!sessions.isActive(session) || session.userId !== payload.sub) throw new AuthError('SESSION_REVOKED');
+  const user = users.findById(payload.sub);
+  if (!user) throw new AuthError('INVALID_TOKEN');
+  return { user, sid: payload.sid, exp: payload.exp };
+}
+
+export function requireAuth(req, _res, next) {
+  const header = req.get('authorization') ?? '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) return next(new AuthError('NO_TOKEN'));
+  try {
+    const { user, sid } = verifyAccessToken(token);
+    req.user = user;
+    req.sid = sid;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+function newRefreshSecret() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function setRefreshCookie(res, sid, secret) {
+  res.cookie(REFRESH_COOKIE, `${sid}.${secret}`, {
+    httpOnly: true,
+    secure: config.isProd,
+    sameSite: 'strict',
+    path: '/api/auth',
+    maxAge: config.refreshTtlMs,
+  });
+}
+
+function clearRefreshCookie(res) {
+  res.clearCookie(REFRESH_COOKIE, { httpOnly: true, secure: config.isProd, sameSite: 'strict', path: '/api/auth' });
+}
+
+function startSession(req, res, user) {
+  const secret = newRefreshSecret();
+  const session = sessions.create({ userId: user.id, tokenHash: sha256(secret).toString('hex'), userAgent: req.get('user-agent') });
+  setRefreshCookie(res, session.id, secret);
+  return { user: publicUser(user), accessToken: signAccessToken(user, session.id) };
+}
+
+function parseRefreshCookie(req) {
+  const raw = req.cookies?.[REFRESH_COOKIE];
+  if (typeof raw !== 'string') return null;
+  const dot = raw.indexOf('.');
+  if (dot < 1) return null;
+  return { sid: raw.slice(0, dot), secret: raw.slice(dot + 1) };
+}
+
+const hashMatches = (hex, secret) => {
+  if (!hex) return false;
+  const expected = Buffer.from(hex, 'hex');
+  const actual = sha256(secret);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+};
+
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+const credentialLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
+});
+
+function readCredentials(body) {
+  const username = typeof body?.username === 'string' ? body.username.trim() : '';
+  const password = typeof body?.password === 'string' ? body.password : '';
+  return { username, password };
+}
+
+export const authRouter = express.Router();
+
+authRouter.post(
+  '/register',
+  credentialLimiter,
+  asyncHandler(async (req, res) => {
+    const { username, password } = readCredentials(req.body);
+    const displayName = (typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : '') || username;
+    if (!USERNAME_RE.test(username)) {
+      return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
+    }
+    if (password.length < 8 || password.length > 128) {
+      return res.status(400).json({ error: 'Password must be 8-128 characters' });
+    }
+    if (displayName.length > 40) return res.status(400).json({ error: 'Display name must be at most 40 characters' });
+    if (users.findByUsername(username)) return res.status(409).json({ error: 'That username is taken' });
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = users.create({ username, displayName, passwordHash });
+    req.app.get('io')?.emit('user:new', publicUser(user));
+    res.status(201).json(startSession(req, res, user));
+  }),
+);
+
+authRouter.post(
+  '/login',
+  credentialLimiter,
+  asyncHandler(async (req, res) => {
+    const { username, password } = readCredentials(req.body);
+    const user = username ? users.findByUsername(username) : null;
+    // Always run bcrypt so response time doesn't reveal whether the username exists.
+    const ok = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+    if (!user || !ok) return res.status(401).json({ error: 'Invalid username or password', code: 'BAD_CREDENTIALS' });
+    res.json(startSession(req, res, user));
+  }),
+);
+
+authRouter.post('/refresh', (req, res, next) => {
+  const parsed = parseRefreshCookie(req);
+  const session = parsed && sessions.findById(parsed.sid);
+  if (!sessions.isActive(session)) {
+    clearRefreshCookie(res);
+    return next(new AuthError('NO_SESSION', 'Session expired, please sign in again'));
+  }
+
+  const current = hashMatches(session.tokenHash, parsed.secret);
+  const recentPrev = !current && Date.now() - session.rotatedAt < ROTATION_GRACE_MS && hashMatches(session.prevTokenHash, parsed.secret);
+  if (!current && !recentPrev) {
+    // A rotated-out token was replayed: assume it was stolen and kill the session.
+    sessions.revoke(session);
+    req.app.get('io')?.in(`session:${session.id}`).disconnectSockets(true);
+    clearRefreshCookie(res);
+    return next(new AuthError('TOKEN_REUSE', 'Session expired, please sign in again'));
+  }
+
+  const user = users.findById(session.userId);
+  if (!user) return next(new AuthError('NO_SESSION'));
+  const secret = newRefreshSecret();
+  sessions.rotate(session, sha256(secret).toString('hex'));
+  setRefreshCookie(res, session.id, secret);
+  res.json({ user: publicUser(user), accessToken: signAccessToken(user, session.id) });
+});
+
+authRouter.post('/logout', (req, res) => {
+  const parsed = parseRefreshCookie(req);
+  const session = parsed && sessions.findById(parsed.sid);
+  if (session && hashMatches(session.tokenHash, parsed.secret) && !session.revokedAt) {
+    sessions.revoke(session);
+    req.app.get('io')?.in(`session:${session.id}`).disconnectSockets(true);
+  }
+  clearRefreshCookie(res);
+  res.status(204).end();
+});
+
+authRouter.get('/me', requireAuth, (req, res) => {
+  res.json({ user: publicUser(req.user) });
+});

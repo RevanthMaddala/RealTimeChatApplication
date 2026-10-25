@@ -1,0 +1,154 @@
+// Tiny JSON-file persistence layer. Everything lives in memory and is flushed
+// to disk (atomically, debounced) after each write. Swap this module for
+// MongoDB/Postgres without touching the routes or socket handlers.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { config } from './config.js';
+
+const DEFAULT_ROOMS = [
+  { id: 'general', name: 'general', description: 'Company-wide announcements and chatter' },
+  { id: 'random', name: 'random', description: 'Off-topic, memes and everything else' },
+  { id: 'help', name: 'help', description: 'Ask questions, get answers' },
+];
+
+function load() {
+  try {
+    return JSON.parse(fs.readFileSync(config.dataFile, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    return {
+      users: [],
+      sessions: [],
+      rooms: DEFAULT_ROOMS.map((r) => ({ ...r, type: 'public', createdBy: null, createdAt: Date.now() })),
+      messages: {},
+    };
+  }
+}
+
+const data = load();
+
+let saveTimer = null;
+function writeNow() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  fs.mkdirSync(path.dirname(config.dataFile), { recursive: true });
+  const tmp = `${config.dataFile}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.renameSync(tmp, config.dataFile);
+}
+function persist() {
+  if (!saveTimer) saveTimer = setTimeout(writeNow, 100);
+}
+export function flush() {
+  if (saveTimer) writeNow();
+}
+
+const id = () => crypto.randomUUID();
+
+export function publicUser(u) {
+  return { id: u.id, username: u.username, displayName: u.displayName, lastSeenAt: u.lastSeenAt ?? null };
+}
+
+export const users = {
+  findById: (userId) => data.users.find((u) => u.id === userId),
+  findByUsername: (username) => {
+    const needle = username.toLowerCase();
+    return data.users.find((u) => u.username.toLowerCase() === needle);
+  },
+  all: () => data.users,
+  create({ username, displayName, passwordHash }) {
+    const user = { id: id(), username, displayName, passwordHash, createdAt: Date.now(), lastSeenAt: null };
+    data.users.push(user);
+    persist();
+    return user;
+  },
+  touchLastSeen(userId) {
+    const u = users.findById(userId);
+    if (u) {
+      u.lastSeenAt = Date.now();
+      persist();
+    }
+    return u;
+  },
+};
+
+export const sessions = {
+  findById: (sid) => data.sessions.find((s) => s.id === sid),
+  create({ userId, tokenHash, userAgent }) {
+    const now = Date.now();
+    const session = {
+      id: id(),
+      userId,
+      tokenHash,
+      prevTokenHash: null,
+      rotatedAt: now,
+      userAgent: String(userAgent ?? '').slice(0, 200),
+      createdAt: now,
+      expiresAt: now + config.refreshTtlMs,
+      revokedAt: null,
+    };
+    data.sessions.push(session);
+    persist();
+    return session;
+  },
+  rotate(session, tokenHash) {
+    session.prevTokenHash = session.tokenHash;
+    session.tokenHash = tokenHash;
+    session.rotatedAt = Date.now();
+    session.expiresAt = Date.now() + config.refreshTtlMs;
+    persist();
+  },
+  revoke(session) {
+    session.revokedAt = Date.now();
+    persist();
+  },
+  isActive: (s) => Boolean(s) && !s.revokedAt && s.expiresAt > Date.now(),
+  pruneExpired() {
+    const before = data.sessions.length;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    data.sessions = data.sessions.filter((s) => s.expiresAt > cutoff && !(s.revokedAt && s.revokedAt < cutoff));
+    if (data.sessions.length !== before) persist();
+  },
+};
+
+export const rooms = {
+  findById: (roomId) => data.rooms.find((r) => r.id === roomId),
+  findByName: (name) => data.rooms.find((r) => r.type === 'public' && r.name === name),
+  canAccess: (room, userId) => Boolean(room) && (room.type === 'public' || room.members.includes(userId)),
+  listForUser: (userId) => data.rooms.filter((r) => rooms.canAccess(r, userId)),
+  createPublic({ name, description, createdBy }) {
+    const room = { id: id(), name, description, type: 'public', createdBy, createdAt: Date.now() };
+    data.rooms.push(room);
+    persist();
+    return room;
+  },
+  getOrCreateDm(userA, userB) {
+    const members = [userA, userB].sort();
+    const roomId = `dm:${members.join(':')}`;
+    let room = rooms.findById(roomId);
+    if (room) return { room, created: false };
+    room = { id: roomId, name: null, description: '', type: 'dm', members, createdBy: userA, createdAt: Date.now() };
+    data.rooms.push(room);
+    persist();
+    return { room, created: true };
+  },
+};
+
+export const messages = {
+  create({ roomId, userId, text }) {
+    const message = { id: id(), roomId, userId, text, createdAt: Date.now() };
+    (data.messages[roomId] ??= []).push(message);
+    persist();
+    return message;
+  },
+  /** Oldest-first page of up to `limit` messages that precede message `beforeId` (or the latest ones). */
+  page(roomId, { beforeId, limit }) {
+    const all = data.messages[roomId] ?? [];
+    let end = all.length;
+    if (beforeId) end = Math.max(0, all.findIndex((m) => m.id === beforeId));
+    const start = Math.max(0, end - limit);
+    return { items: all.slice(start, end), hasMore: start > 0 };
+  },
+  lastInRoom: (roomId) => data.messages[roomId]?.at(-1) ?? null,
+};
