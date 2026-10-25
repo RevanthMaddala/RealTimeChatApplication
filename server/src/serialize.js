@@ -1,4 +1,5 @@
-import { users, messages, publicUser } from './db.js';
+import { users, messages, attachments, publicUser } from './db.js';
+import { serializeAttachment } from './attachments.js';
 
 export function serializeMessage(m) {
   const author = users.findById(m.userId);
@@ -6,6 +7,10 @@ export function serializeMessage(m) {
     id: m.id,
     roomId: m.roomId,
     text: m.text,
+    attachments: (m.attachmentIds ?? [])
+      .map((id) => attachments.findById(id))
+      .filter(Boolean)
+      .map(serializeAttachment),
     createdAt: m.createdAt,
     author: author ? { id: author.id, username: author.username, displayName: author.displayName } : null,
   };

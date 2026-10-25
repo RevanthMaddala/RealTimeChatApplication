@@ -22,11 +22,13 @@ function load() {
       sessions: [],
       rooms: DEFAULT_ROOMS.map((r) => ({ ...r, type: 'public', createdBy: null, createdAt: Date.now() })),
       messages: {},
+      attachments: [],
     };
   }
 }
 
 const data = load();
+data.attachments ??= []; // stores created before attachments existed
 
 let saveTimer = null;
 function writeNow() {
@@ -40,6 +42,10 @@ function writeNow() {
 function persist() {
   if (!saveTimer) saveTimer = setTimeout(writeNow, 100);
 }
+// Session changes are written before the response goes out: if the process died inside
+// the debounce window after a refresh-token rotation, the browser would hold a cookie the
+// store never saw, and the next refresh would be treated as token theft.
+const persistNow = writeNow;
 export function flush() {
   if (saveTimer) writeNow();
 }
@@ -89,7 +95,7 @@ export const sessions = {
       revokedAt: null,
     };
     data.sessions.push(session);
-    persist();
+    persistNow();
     return session;
   },
   rotate(session, tokenHash) {
@@ -97,11 +103,11 @@ export const sessions = {
     session.tokenHash = tokenHash;
     session.rotatedAt = Date.now();
     session.expiresAt = Date.now() + config.refreshTtlMs;
-    persist();
+    persistNow();
   },
   revoke(session) {
     session.revokedAt = Date.now();
-    persist();
+    persistNow();
   },
   isActive: (s) => Boolean(s) && !s.revokedAt && s.expiresAt > Date.now(),
   pruneExpired() {
@@ -136,8 +142,8 @@ export const rooms = {
 };
 
 export const messages = {
-  create({ roomId, userId, text }) {
-    const message = { id: id(), roomId, userId, text, createdAt: Date.now() };
+  create({ roomId, userId, text, attachmentIds = [] }) {
+    const message = { id: id(), roomId, userId, text, attachmentIds, createdAt: Date.now() };
     (data.messages[roomId] ??= []).push(message);
     persist();
     return message;
@@ -151,4 +157,30 @@ export const messages = {
     return { items: all.slice(start, end), hasMore: start > 0 };
   },
   lastInRoom: (roomId) => data.messages[roomId]?.at(-1) ?? null,
+};
+
+export const attachments = {
+  findById: (attachmentId) => data.attachments.find((a) => a.id === attachmentId),
+  create({ id: attachmentId, roomId, uploaderId, name, mime, size, kind }) {
+    const attachment = { id: attachmentId, roomId, uploaderId, name, mime, size, kind, messageId: null, createdAt: Date.now() };
+    data.attachments.push(attachment);
+    persist();
+    return attachment;
+  },
+  /** Uploads this user made in this room that haven't been sent in a message yet. */
+  claimable(ids, { roomId, uploaderId }) {
+    return ids.map((aid) => attachments.findById(aid)).filter((a) => a && a.roomId === roomId && a.uploaderId === uploaderId && !a.messageId);
+  },
+  linkToMessage(list, messageId) {
+    for (const a of list) a.messageId = messageId;
+    persist();
+  },
+  removeOrphans(olderThan) {
+    const orphans = data.attachments.filter((a) => !a.messageId && a.createdAt < olderThan);
+    if (orphans.length) {
+      data.attachments = data.attachments.filter((a) => !orphans.includes(a));
+      persist();
+    }
+    return orphans;
+  },
 };

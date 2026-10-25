@@ -2,6 +2,7 @@ import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import { useChat } from '../ChatContext.jsx';
 import { formatDay, formatTime, sameDay } from '../time.js';
 import Avatar from './Avatar.jsx';
+import { Attachments, Lightbox } from './Attachments.jsx';
 
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 const NEAR_BOTTOM_PX = 80;
@@ -15,6 +16,14 @@ export default function MessageList({ roomId }) {
   const stickToBottom = useRef(true);
   const prev = useRef({ roomId: null, first: null, last: null, height: 0 });
   const [showJump, setShowJump] = useState(false);
+  const [lightbox, setLightbox] = useState(null);
+
+  // Media grows after it loads; stay pinned to the bottom if we were there.
+  const onMediaLoad = () => {
+    const el = scrollRef.current;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
+    if (el) prev.current.height = el.scrollHeight;
+  };
 
   // Keep the viewport where the user expects it: pinned to the bottom for new
   // messages, anchored in place when older history is prepended above.
@@ -102,7 +111,8 @@ export default function MessageList({ roomId }) {
                       <time dateTime={new Date(m.createdAt).toISOString()}>{formatTime(m.createdAt)}</time>
                     </header>
                   )}
-                  <p className="msg-text">{m.text}</p>
+                  {m.text && <p className="msg-text">{m.text}</p>}
+                  <Attachments items={m.attachments} onOpenImage={setLightbox} onMediaLoad={onMediaLoad} />
                   {m.pending && <span className="msg-status">Sending…</span>}
                   {m.failed && (
                     <span className="msg-status error">
@@ -127,6 +137,7 @@ export default function MessageList({ roomId }) {
           New messages ↓
         </button>
       )}
+      {lightbox && <Lightbox attachment={lightbox} onClose={() => setLightbox(null)} />}
     </div>
   );
 }

@@ -292,8 +292,9 @@ export function ChatProvider({ children }) {
     [loadHistory],
   );
 
-  const emitMessage = useCallback((roomId, text, clientId) => {
-    socketRef.current.timeout(10_000).emit('message:send', { roomId, text, clientId }, (err, res) => {
+  const emitMessage = useCallback((roomId, text, clientId, attachments = []) => {
+    const payload = { roomId, text, clientId, attachmentIds: attachments.map((a) => a.id) };
+    socketRef.current.timeout(10_000).emit('message:send', payload, (err, res) => {
       if (err || !res?.ok) {
         dispatch({ type: 'MESSAGE_FAILED', roomId, clientId, error: err ? 'Timed out — tap to retry' : res.error });
       }
@@ -301,7 +302,7 @@ export function ChatProvider({ children }) {
   }, []);
 
   const sendMessage = useCallback(
-    (text) => {
+    (text, attachments = []) => {
       const roomId = stateRef.current.activeRoomId;
       const clientId = makeClientId();
       dispatch({
@@ -310,12 +311,13 @@ export function ChatProvider({ children }) {
           clientId,
           roomId,
           text,
+          attachments,
           createdAt: Date.now(),
           pending: true,
           author: { id: user.id, username: user.username, displayName: user.displayName },
         },
       });
-      emitMessage(roomId, text, clientId);
+      emitMessage(roomId, text, clientId, attachments);
     },
     [user, emitMessage],
   );
@@ -325,7 +327,7 @@ export function ChatProvider({ children }) {
       dispatch({ type: 'MESSAGE_DISCARD', roomId: message.roomId, clientId: message.clientId });
       const clientId = makeClientId();
       dispatch({ type: 'MESSAGE_PENDING', message: { ...message, clientId, failed: false, pending: true, error: null } });
-      emitMessage(message.roomId, message.text, clientId);
+      emitMessage(message.roomId, message.text, clientId, message.attachments);
     },
     [emitMessage],
   );

@@ -6,21 +6,30 @@ import helmet from 'helmet';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { config } from './config.js';
-import { authRouter, requireAuth } from './auth.js';
+import { authRouter, requireAuth, requireMediaCookie } from './auth.js';
 import { apiRouter } from './api.js';
+import { handleDownload, pruneOrphanUploads } from './attachments.js';
 import { initSocket } from './socket.js';
 import { flush, sessions } from './db.js';
 
 const app = express();
 if (config.isProd) app.set('trust proxy', 1);
 app.disable('x-powered-by');
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      // blob: lets the composer preview a picked file before it's uploaded.
+      directives: { imgSrc: ["'self'", 'data:', 'blob:'], mediaSrc: ["'self'", 'blob:'] },
+    },
+  }),
+);
 app.use(cors({ origin: config.clientOrigin, credentials: true }));
 app.use(express.json({ limit: '16kb' }));
 app.use(cookieParser());
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRouter);
+app.get('/api/attachments/:id', requireMediaCookie, handleDownload);
 app.use('/api', requireAuth, apiRouter);
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
@@ -41,8 +50,12 @@ app.use((err, _req, res, _next) => {
 const server = http.createServer(app);
 app.set('io', initSocket(server));
 
-sessions.pruneExpired();
-setInterval(() => sessions.pruneExpired(), 60 * 60 * 1000).unref();
+const housekeeping = () => {
+  sessions.pruneExpired();
+  pruneOrphanUploads().catch((err) => console.error('[uploads] prune failed', err));
+};
+housekeeping();
+setInterval(housekeeping, 15 * 60 * 1000).unref();
 
 server.listen(config.port, () => {
   console.log(`[server] listening on http://localhost:${config.port}`);

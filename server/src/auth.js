@@ -6,6 +6,9 @@
 //    rotated on every use, and presenting a stale one revokes the whole session.
 //  - Every access token carries its session id, so logout/revocation takes effect
 //    immediately for HTTP requests and connected sockets alike.
+//  - Media token: <img>/<video> tags can't send a Bearer header, so attachments are
+//    authorised by a separate JWT (audience "media") in an httpOnly cookie scoped to
+//    /api/attachments. It's refreshed alongside the access token and is useless as one.
 import crypto from 'node:crypto';
 import express from 'express';
 import bcrypt from 'bcryptjs';
@@ -15,6 +18,9 @@ import { config } from './config.js';
 import { users, sessions, publicUser } from './db.js';
 
 const REFRESH_COOKIE = 'rt_refresh';
+const MEDIA_COOKIE = 'rt_media';
+const MEDIA_PATH = '/api/attachments';
+const MEDIA_TTL_SECONDS = 60 * 60;
 const ROTATION_GRACE_MS = 10_000; // lets two tabs refresh concurrently without tripping reuse detection
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const DUMMY_HASH = bcrypt.hashSync('timing-equaliser', 12);
@@ -34,14 +40,24 @@ function signAccessToken(user, sid) {
     algorithm: 'HS256',
     expiresIn: config.accessTtl,
     issuer: 'rt-chat',
+    audience: 'api',
+  });
+}
+
+function signMediaToken(user, sid) {
+  return jwt.sign({ sub: user.id, sid }, config.accessSecret, {
+    algorithm: 'HS256',
+    expiresIn: MEDIA_TTL_SECONDS,
+    issuer: 'rt-chat',
+    audience: 'media',
   });
 }
 
 /** Validates the JWT *and* that its session is still live. Returns { user, sid, exp }. */
-export function verifyAccessToken(token) {
+export function verifyAccessToken(token, audience = 'api') {
   let payload;
   try {
-    payload = jwt.verify(token, config.accessSecret, { algorithms: ['HS256'], issuer: 'rt-chat' });
+    payload = jwt.verify(token, config.accessSecret, { algorithms: ['HS256'], issuer: 'rt-chat', audience });
   } catch (err) {
     throw new AuthError(err instanceof jwt.TokenExpiredError ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN');
   }
@@ -66,6 +82,17 @@ export function requireAuth(req, _res, next) {
   }
 }
 
+export function requireMediaCookie(req, _res, next) {
+  const token = req.cookies?.[MEDIA_COOKIE];
+  if (typeof token !== 'string') return next(new AuthError('NO_TOKEN'));
+  try {
+    req.user = verifyAccessToken(token, 'media').user;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 function newRefreshSecret() {
   return crypto.randomBytes(32).toString('base64url');
 }
@@ -82,13 +109,26 @@ function setRefreshCookie(res, sid, secret) {
 
 function clearRefreshCookie(res) {
   res.clearCookie(REFRESH_COOKIE, { httpOnly: true, secure: config.isProd, sameSite: 'strict', path: '/api/auth' });
+  res.clearCookie(MEDIA_COOKIE, { httpOnly: true, secure: config.isProd, sameSite: 'strict', path: MEDIA_PATH });
+}
+
+/** Sets both cookies and returns the response body for login/register/refresh. */
+function issueTokens(res, user, sid, refreshSecret) {
+  setRefreshCookie(res, sid, refreshSecret);
+  res.cookie(MEDIA_COOKIE, signMediaToken(user, sid), {
+    httpOnly: true,
+    secure: config.isProd,
+    sameSite: 'strict',
+    path: MEDIA_PATH,
+    maxAge: MEDIA_TTL_SECONDS * 1000,
+  });
+  return { user: publicUser(user), accessToken: signAccessToken(user, sid) };
 }
 
 function startSession(req, res, user) {
   const secret = newRefreshSecret();
   const session = sessions.create({ userId: user.id, tokenHash: sha256(secret).toString('hex'), userAgent: req.get('user-agent') });
-  setRefreshCookie(res, session.id, secret);
-  return { user: publicUser(user), accessToken: signAccessToken(user, session.id) };
+  return issueTokens(res, user, session.id, secret);
 }
 
 function parseRefreshCookie(req) {
@@ -181,8 +221,7 @@ authRouter.post('/refresh', (req, res, next) => {
   if (!user) return next(new AuthError('NO_SESSION'));
   const secret = newRefreshSecret();
   sessions.rotate(session, sha256(secret).toString('hex'));
-  setRefreshCookie(res, session.id, secret);
-  res.json({ user: publicUser(user), accessToken: signAccessToken(user, session.id) });
+  res.json(issueTokens(res, user, session.id, secret));
 });
 
 authRouter.post('/logout', (req, res) => {

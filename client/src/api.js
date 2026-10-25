@@ -97,6 +97,42 @@ export async function api(path, options) {
   }
 }
 
+/**
+ * Uploads one file to a room. Uses XHR rather than fetch so we get upload progress.
+ * Resolves with the server's attachment record; retries once after a token refresh.
+ */
+export function uploadFile(roomId, file, { onProgress, signal } = {}) {
+  const attempt = () =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `/api/rooms/${encodeURIComponent(roomId)}/attachments`);
+      xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+      xhr.onload = () => {
+        let data = null;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch {
+          /* non-JSON error page */
+        }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data.attachment);
+        else reject(new ApiError(xhr.status, data?.error ?? 'Upload failed', data?.code));
+      };
+      xhr.onerror = () => reject(new ApiError(0, 'Network error during upload'));
+      xhr.onabort = () => reject(new ApiError(0, 'Upload cancelled', 'ABORTED'));
+      signal?.addEventListener('abort', () => xhr.abort(), { once: true });
+      xhr.send(file);
+    });
+
+  return attempt().catch(async (err) => {
+    if (err.status !== 401) throw err;
+    await refreshSession();
+    return attempt();
+  });
+}
+
 export async function login(username, password) {
   const data = await request('/api/auth/login', { method: 'POST', body: { username, password }, auth: false });
   setAccessToken(data.accessToken);

@@ -23,5 +23,6 @@ export const config = {
   accessTtl: process.env.ACCESS_TOKEN_TTL || '15m',
   refreshTtlMs: (Number(process.env.REFRESH_TOKEN_TTL_DAYS) || 7) * 24 * 60 * 60 * 1000,
   dataFile: path.resolve(rootDir, process.env.DATA_FILE || './data/db.json'),
+  uploadsDir: path.resolve(rootDir, process.env.UPLOADS_DIR || './data/uploads'),
   clientDist: path.resolve(rootDir, '../client/dist'),
 };

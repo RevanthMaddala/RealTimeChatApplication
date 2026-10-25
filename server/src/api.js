@@ -2,6 +2,7 @@ import express from 'express';
 import { users, rooms, messages, publicUser } from './db.js';
 import { serializeMessage, serializeRoom } from './serialize.js';
 import { isOnline } from './presence.js';
+import { handleUpload, uploadLimiter } from './attachments.js';
 
 const ROOM_NAME_RE = /^[a-z0-9][a-z0-9-]{1,31}$/;
 
@@ -53,6 +54,8 @@ apiRouter.get('/rooms/:roomId/messages', (req, res) => {
   const { items, hasMore } = messages.page(room.id, { beforeId, limit });
   res.json({ messages: items.map(serializeMessage), hasMore });
 });
+
+apiRouter.post('/rooms/:roomId/attachments', uploadLimiter, handleUpload);
 
 apiRouter.get('/users', (req, res) => {
   res.json({
