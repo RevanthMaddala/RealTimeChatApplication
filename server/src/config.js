@@ -25,4 +25,19 @@ export const config = {
   dataFile: path.resolve(rootDir, process.env.DATA_FILE || './data/db.json'),
   uploadsDir: path.resolve(rootDir, process.env.UPLOADS_DIR || './data/uploads'),
   clientDist: path.resolve(rootDir, '../client/dist'),
+  // Public URL of the app, used to build links in emails.
+  appUrl: (process.env.APP_URL || process.env.CLIENT_ORIGIN || 'http://localhost:5173').replace(/\/+$/, ''),
+  resetTtlMs: (Number(process.env.PASSWORD_RESET_TTL_MINUTES) || 30) * 60 * 1000,
+  // Without SMTP_HOST, emails are printed to the server console instead of sent (dev only).
+  smtp: process.env.SMTP_HOST
+    ? {
+        host: process.env.SMTP_HOST,
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+      }
+    : null,
+  mailFrom: process.env.MAIL_FROM || 'Relay <no-reply@localhost>',
 };
+
+if (isProd && !config.smtp) throw new Error('SMTP_HOST must be set in production so password reset emails can be sent');

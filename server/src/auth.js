@@ -9,13 +9,16 @@
 //  - Media token: <img>/<video> tags can't send a Bearer header, so attachments are
 //    authorised by a separate JWT (audience "media") in an httpOnly cookie scoped to
 //    /api/attachments. It's refreshed alongside the access token and is useless as one.
+//  - Password reset: a random single-use token, emailed as a link and stored only as a
+//    SHA-256 hash, expiring after config.resetTtlMs. Using it revokes every session.
 import crypto from 'node:crypto';
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
-import { users, sessions, publicUser } from './db.js';
+import { users, sessions, passwordResets, publicUser } from './db.js';
+import { sendPasswordResetMail } from './mailer.js';
 
 const REFRESH_COOKIE = 'rt_refresh';
 const MEDIA_COOKIE = 'rt_media';
@@ -23,6 +26,7 @@ const MEDIA_PATH = '/api/attachments';
 const MEDIA_TTL_SECONDS = 60 * 60;
 const ROTATION_GRACE_MS = 10_000; // lets two tabs refresh concurrently without tripping reuse detection
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DUMMY_HASH = bcrypt.hashSync('timing-equaliser', 12);
 
 export class AuthError extends Error {
@@ -156,10 +160,30 @@ const credentialLimiter = rateLimit({
   message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
 });
 
+// Reset requests send email, so they get a much tighter budget than sign-in attempts.
+const resetRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many reset requests, please try again later', code: 'RATE_LIMITED' },
+});
+
 function readCredentials(body) {
   const username = typeof body?.username === 'string' ? body.username.trim() : '';
   const password = typeof body?.password === 'string' ? body.password : '';
   return { username, password };
+}
+
+const readEmail = (body) => (typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '');
+const isValidEmail = (email) => email.length <= 254 && EMAIL_RE.test(email);
+const isValidPassword = (password) => password.length >= 8 && password.length <= 128;
+const PASSWORD_RULE = 'Password must be 8-128 characters';
+
+/** Revokes all of a user's sessions and disconnects their sockets. */
+function endAllSessions(req, userId) {
+  const io = req.app.get('io');
+  for (const s of sessions.revokeAllForUser(userId)) io?.in(`session:${s.id}`).disconnectSockets(true);
 }
 
 export const authRouter = express.Router();
@@ -169,18 +193,19 @@ authRouter.post(
   credentialLimiter,
   asyncHandler(async (req, res) => {
     const { username, password } = readCredentials(req.body);
+    const email = readEmail(req.body);
     const displayName = (typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : '') || username;
     if (!USERNAME_RE.test(username)) {
       return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
     }
-    if (password.length < 8 || password.length > 128) {
-      return res.status(400).json({ error: 'Password must be 8-128 characters' });
-    }
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+    if (!isValidPassword(password)) return res.status(400).json({ error: PASSWORD_RULE });
     if (displayName.length > 40) return res.status(400).json({ error: 'Display name must be at most 40 characters' });
     if (users.findByUsername(username)) return res.status(409).json({ error: 'That username is taken' });
+    if (users.findByEmail(email)) return res.status(409).json({ error: 'That email is already used by another account' });
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = users.create({ username, displayName, passwordHash });
+    const user = users.create({ username, displayName, email, passwordHash });
     req.app.get('io')?.emit('user:new', publicUser(user));
     res.status(201).json(startSession(req, res, user));
   }),
@@ -236,5 +261,65 @@ authRouter.post('/logout', (req, res) => {
 });
 
 authRouter.get('/me', requireAuth, (req, res) => {
-  res.json({ user: publicUser(req.user) });
+  res.json({ user: publicUser(req.user), email: req.user.email ?? null });
 });
+
+// Lets a signed-in user add or change their recovery email. Requires the current
+// password so a hijacked session can't redirect password resets to an attacker.
+authRouter.put(
+  '/email',
+  credentialLimiter,
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const email = readEmail(req.body);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+    if (!(await bcrypt.compare(password, req.user.passwordHash))) {
+      return res.status(403).json({ error: 'Current password is incorrect', code: 'BAD_CREDENTIALS' });
+    }
+    const owner = users.findByEmail(email);
+    if (owner && owner.id !== req.user.id) return res.status(409).json({ error: 'That email is already used by another account' });
+    users.setEmail(req.user, email);
+    res.json({ email });
+  }),
+);
+
+// Always answers the same way, whether or not the address belongs to an account, and
+// does the lookup + send after responding so timing doesn't give that away either.
+authRouter.post('/forgot-password', resetRequestLimiter, (req, res) => {
+  const email = readEmail(req.body);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+  res.status(202).json({ ok: true });
+
+  setImmediate(() => {
+    const user = users.findByEmail(email);
+    if (!user) return;
+    const token = crypto.randomBytes(32).toString('base64url');
+    passwordResets.create({ userId: user.id, tokenHash: sha256(token).toString('hex'), ttlMs: config.resetTtlMs });
+    // The token goes in the fragment, which browsers never send to servers or in Referer headers.
+    sendPasswordResetMail(user, `${config.appUrl}/reset-password#token=${token}`).catch((err) =>
+      console.error('[mail] password reset email failed', err),
+    );
+  });
+});
+
+authRouter.post(
+  '/reset-password',
+  credentialLimiter,
+  asyncHandler(async (req, res) => {
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const reset = token && passwordResets.findLiveByHash(sha256(token).toString('hex'));
+    const user = reset && users.findById(reset.userId);
+    if (!user) {
+      return res.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.', code: 'RESET_INVALID' });
+    }
+    if (!isValidPassword(password)) return res.status(400).json({ error: PASSWORD_RULE });
+
+    // Consume before the slow hash so the same link can't be raced into two resets.
+    passwordResets.consume(reset);
+    users.setPassword(user, await bcrypt.hash(password, 12));
+    endAllSessions(req, user.id);
+    res.json(startSession(req, res, user));
+  }),
+);

@@ -23,12 +23,14 @@ function load() {
       rooms: DEFAULT_ROOMS.map((r) => ({ ...r, type: 'public', createdBy: null, createdAt: Date.now() })),
       messages: {},
       attachments: [],
+      passwordResets: [],
     };
   }
 }
 
 const data = load();
 data.attachments ??= []; // stores created before attachments existed
+data.passwordResets ??= []; // ...or password resets
 
 let saveTimer = null;
 function writeNow() {
@@ -62,12 +64,22 @@ export const users = {
     const needle = username.toLowerCase();
     return data.users.find((u) => u.username.toLowerCase() === needle);
   },
+  /** Emails are stored lower-cased, so callers pass a normalised address. */
+  findByEmail: (email) => data.users.find((u) => u.email === email),
   all: () => data.users,
-  create({ username, displayName, passwordHash }) {
-    const user = { id: id(), username, displayName, passwordHash, createdAt: Date.now(), lastSeenAt: null };
+  create({ username, displayName, email, passwordHash }) {
+    const user = { id: id(), username, displayName, email, passwordHash, createdAt: Date.now(), lastSeenAt: null };
     data.users.push(user);
     persist();
     return user;
+  },
+  setEmail(user, email) {
+    user.email = email;
+    persistNow();
+  },
+  setPassword(user, passwordHash) {
+    user.passwordHash = passwordHash;
+    persistNow();
   },
   touchLastSeen(userId) {
     const u = users.findById(userId);
@@ -109,12 +121,43 @@ export const sessions = {
     session.revokedAt = Date.now();
     persistNow();
   },
+  /** Revokes every live session for a user and returns them (so callers can drop their sockets). */
+  revokeAllForUser(userId) {
+    const now = Date.now();
+    const live = data.sessions.filter((s) => s.userId === userId && sessions.isActive(s));
+    for (const s of live) s.revokedAt = now;
+    if (live.length) persistNow();
+    return live;
+  },
   isActive: (s) => Boolean(s) && !s.revokedAt && s.expiresAt > Date.now(),
   pruneExpired() {
     const before = data.sessions.length;
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     data.sessions = data.sessions.filter((s) => s.expiresAt > cutoff && !(s.revokedAt && s.revokedAt < cutoff));
     if (data.sessions.length !== before) persist();
+  },
+};
+
+// Only the SHA-256 of a reset token is stored, so a leaked db file can't be used to reset passwords.
+export const passwordResets = {
+  /** Issues a new token for the user, replacing any earlier one so only the latest emailed link works. */
+  create({ userId, tokenHash, ttlMs }) {
+    const now = Date.now();
+    data.passwordResets = data.passwordResets.filter((r) => r.userId !== userId);
+    const reset = { id: id(), userId, tokenHash, createdAt: now, expiresAt: now + ttlMs };
+    data.passwordResets.push(reset);
+    persistNow();
+    return reset;
+  },
+  findLiveByHash: (tokenHash) => data.passwordResets.find((r) => r.tokenHash === tokenHash && r.expiresAt > Date.now()),
+  consume(reset) {
+    data.passwordResets = data.passwordResets.filter((r) => r.userId !== reset.userId);
+    persistNow();
+  },
+  pruneExpired() {
+    const before = data.passwordResets.length;
+    data.passwordResets = data.passwordResets.filter((r) => r.expiresAt > Date.now());
+    if (data.passwordResets.length !== before) persist();
   },
 };
 

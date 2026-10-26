@@ -21,6 +21,7 @@ Full-stack real-time chat for many concurrent users. React front end (responsive
 | Instant revocation | Every request and socket handshake checks the session is still live, so logout takes effect immediately; live sockets in that session are disconnected. |
 | Socket expiry | The server drops a socket when its token expires unless the client sends a refreshed token (`auth:refresh`) first, which the client does automatically. |
 | Passwords | bcrypt (cost 12); login does constant work whether or not the user exists. |
+| Password reset | "Forgot password?" emails a single-use link that expires after 30 minutes. Only the token's SHA-256 hash is stored, and requesting a new link cancels the old one. The token travels in the URL fragment, so it never reaches server logs or `Referer` headers. The request endpoint gives the same answer whether or not the email has an account, and it has its own tight rate limit. Using a link revokes every session and disconnects their sockets. Changing the recovery email requires the current password. |
 | Abuse | Rate limiting on auth endpoints, per-socket message rate limiting, input validation, payload size caps, `helmet` headers. |
 | Authorization | DMs are visible only to their two members, checked on both REST and socket paths. |
 | Attachment types | Allowlist only. The real type is detected from the file's leading bytes and must match the extension, so a script renamed `photo.png` is rejected. HTML, SVG, executables and scripts are blocked outright. Uploads stream to disk with a hard 25 MB cap. |
@@ -47,6 +48,8 @@ Optional demo accounts (`alice`, `bob`, `carol`; the password is printed by the 
 npm run seed -w server
 ```
 
+Without SMTP settings, emails such as password reset links are printed to the server console instead of sent, so you can copy the link from there. Accounts created before email existed can add one under **Account** in the sidebar.
+
 To try multi-user chat yourself, sign in as different users in two different browsers (or a normal + private window), since tabs in the same browser share the session cookie.
 
 ### Production
@@ -56,17 +59,18 @@ npm run build
 ```
 
 ```bash
-NODE_ENV=production JWT_ACCESS_SECRET=<long random string> npm start
+NODE_ENV=production JWT_ACCESS_SECRET=<long random string> SMTP_HOST=<smtp server> APP_URL=<public url> npm start
 ```
 
-In production the Express server also serves the built React app from `client/dist`. Copy `server/.env.example` to `server/.env` for configuration.
+In production the Express server also serves the built React app from `client/dist`. Copy `server/.env.example` to `server/.env` for configuration. Production requires SMTP settings (`SMTP_HOST`, plus `SMTP_USER`/`SMTP_PASS`/`MAIL_FROM` as your provider needs) so reset emails can be delivered.
 
 ## Project structure
 
 ```
 server/src
   index.js       Express app, security middleware, static hosting
-  auth.js        register / login / refresh / logout, JWT + session verification
+  auth.js        register / login / refresh / logout / password reset, JWT + session verification
+  mailer.js      outgoing email (SMTP, or console output in dev)
   api.js         rooms, DMs, message history, user directory (REST)
   attachments.js upload streaming, content sniffing + allowlist, secure download
   socket.js      Socket.io auth middleware, messaging, typing, presence, token expiry

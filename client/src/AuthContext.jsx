@@ -28,8 +28,13 @@ export function AuthProvider({ children }) {
     setState({ status: 'authenticated', user, notice: null });
   }, []);
 
-  const register = useCallback(async (username, password, displayName) => {
-    const { user } = await authApi.register(username, password, displayName);
+  const register = useCallback(async (username, password, displayName, email) => {
+    const { user } = await authApi.register(username, password, displayName, email);
+    setState({ status: 'authenticated', user, notice: null });
+  }, []);
+
+  const resetPassword = useCallback(async (token, password) => {
+    const { user } = await authApi.resetPassword(token, password);
     setState({ status: 'authenticated', user, notice: null });
   }, []);
 
@@ -38,7 +43,10 @@ export function AuthProvider({ children }) {
     await authApi.logout().catch(() => {});
   }, []);
 
-  const value = useMemo(() => ({ ...state, login, register, logout }), [state, login, register, logout]);
+  const value = useMemo(
+    () => ({ ...state, login, register, resetPassword, logout }),
+    [state, login, register, resetPassword, logout],
+  );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 

@@ -12,7 +12,7 @@ for (const u of DEMO_USERS) {
   const res = await fetch(`${API}/api/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...u, password: DEMO_PASSWORD }),
+    body: JSON.stringify({ ...u, email: `${u.username}@example.com`, password: DEMO_PASSWORD }),
   });
   const status = res.status === 201 ? 'created' : res.status === 409 ? 'already exists' : `failed (${res.status})`;
   console.log(`${u.username.padEnd(6)} ${status}`);

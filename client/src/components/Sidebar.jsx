@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useAuth } from '../AuthContext.jsx';
 import { useChat } from '../ChatContext.jsx';
+import AccountDialog from './AccountDialog.jsx';
 import Avatar from './Avatar.jsx';
 
 const CONNECTION_LABEL = {
@@ -53,6 +54,8 @@ export default function Sidebar({ onNavigate }) {
   const { me, rooms, users, online, unread, activeRoomId, connection, selectRoom, openDm } = useChat();
   const [creating, setCreating] = useState(false);
   const [filter, setFilter] = useState('');
+  const [accountOpen, setAccountOpen] = useState(false);
+  const closeAccount = useCallback(() => setAccountOpen(false), []);
 
   const { channels, dms } = useMemo(() => {
     const all = Object.values(rooms);
@@ -165,10 +168,14 @@ export default function Sidebar({ onNavigate }) {
           <strong>{me.displayName}</strong>
           <span className="muted small">@{me.username}</span>
         </div>
+        <button className="btn btn-ghost btn-sm" onClick={() => setAccountOpen(true)}>
+          Account
+        </button>
         <button className="btn btn-ghost btn-sm" onClick={logout}>
           Sign out
         </button>
       </footer>
+      {accountOpen && <AccountDialog onClose={closeAccount} />}
     </aside>
   );
 }

@@ -139,15 +139,30 @@ export async function login(username, password) {
   return data;
 }
 
-export async function register(username, password, displayName) {
+export async function register(username, password, displayName, email) {
   const data = await request('/api/auth/register', {
     method: 'POST',
-    body: { username, password, displayName },
+    body: { username, password, displayName, email },
     auth: false,
   });
   setAccessToken(data.accessToken);
   return data;
 }
+
+export function requestPasswordReset(email) {
+  return request('/api/auth/forgot-password', { method: 'POST', body: { email }, auth: false });
+}
+
+/** Sets a new password with an emailed reset token. Signs this browser in; every other session is ended. */
+export async function resetPassword(token, password) {
+  const data = await request('/api/auth/reset-password', { method: 'POST', body: { token, password }, auth: false });
+  setAccessToken(data.accessToken);
+  return data;
+}
+
+export const getAccount = () => api('/api/auth/me');
+
+export const updateEmail = (email, password) => api('/api/auth/email', { method: 'PUT', body: { email, password } });
 
 export async function logout() {
   try {

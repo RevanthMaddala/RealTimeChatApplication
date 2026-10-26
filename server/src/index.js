@@ -10,7 +10,7 @@ import { authRouter, requireAuth, requireMediaCookie } from './auth.js';
 import { apiRouter } from './api.js';
 import { handleDownload, pruneOrphanUploads } from './attachments.js';
 import { initSocket } from './socket.js';
-import { flush, sessions } from './db.js';
+import { flush, sessions, passwordResets } from './db.js';
 
 const app = express();
 if (config.isProd) app.set('trust proxy', 1);
@@ -52,6 +52,7 @@ app.set('io', initSocket(server));
 
 const housekeeping = () => {
   sessions.pruneExpired();
+  passwordResets.pruneExpired();
   pruneOrphanUploads().catch((err) => console.error('[uploads] prune failed', err));
 };
 housekeeping();
